@@ -1,0 +1,569 @@
+--[[
+	MobileOptimizer v2 (LocalScript)
+	วางที่: StarterPlayer > StarterPlayerScripts  (ลบไฟล์เวอร์ชันเก่าออกก่อน)
+
+	แก้จากเวอร์ชันก่อน:
+	- ของที่เกิดใหม่ (เอฟเฟกต์ ฯลฯ) ถูกใส่คิวแล้วทยอยทำทีละนิดต่อเฟรม (จำกัดเวลา) ไม่ทำพร้อมกันจนกระตุก
+	- ไม่สร้าง table ใหม่ทุกรอบ -> ลด garbage ที่ทำให้กระตุกเป็นพักๆ เมื่อเล่นนาน
+	- คำนวณขอบโซน / ซ่อน-แสดงโซน ทำแบบแบ่งเฟรม ไม่ค้างทีเดียว
+	- ลด Lifetime ของ particle ด้วย (ช่วยกรณี :Emit() เป็นชุดใหญ่ ที่การลด Rate ไม่ช่วย)
+	- cache การเช็กว่าเป็นตัวละคร ไม่ไล่ขึ้น parent ซ้ำๆ
+]]
+
+local Players = game:GetService("Players")
+local Lighting = game:GetService("Lighting")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+----------------------------------------------------------------------
+-- CONFIG
+----------------------------------------------------------------------
+local CONFIG = {
+	ONLY_ON_MOBILE = true,
+	QUALITY_LEVEL = 3,
+	START_TIER = 1,
+	ADAPTIVE = true,
+	LOW_FPS = 25,
+	GOOD_FPS = 50,
+
+	QUEUE_BUDGET = 0.0015,      -- วินาทีต่อเฟรมที่ใช้ประมวลผลของใหม่ (ต่ำ = นุ่มกว่า แต่ของใหม่โดนแก้ช้าลง)
+
+	DISABLE_LENS_FLARE = true,
+	DISABLE_LEGACY_FX = true,
+	DISABLE_POST_EFFECTS = true,
+
+	-- โหมดดินน้ำมัน
+	CLAY_MODE = true,
+	CLAY_SATURATION = 0.8,
+	CLAY_LIGHTEN = 0.06,
+	CLAY_KEEP_NEON = true,
+	CLAY_INCLUDE_CHARACTERS = true,
+	CLAY_STRIP_PBR = true,
+	CLAY_STRIP_TEXTURES = true,
+	CLAY_KEEP_FACES = false,
+	CLAY_LIGHTING = true,
+
+	ZONE_CULLING = true,
+	ZONES = { "map.lobby", "map.map" },
+	ZONE_CULL_DISTANCE = 600,
+	ZONE_RESTORE_MARGIN = 100,
+	ZONE_REFRESH_SECONDS = 120, -- คำนวณขอบโซนใหม่ทุกกี่วินาที (ทำแบบแบ่งเฟรม)
+}
+
+local TIERS = {
+	{ lights = 12, lightDist = 140, rateScale = 0.5,  lifeScale = 0.8, emitDist = 250 },
+	{ lights = 6,  lightDist = 90,  rateScale = 0.25, lifeScale = 0.6, emitDist = 150 },
+	{ lights = 2,  lightDist = 50,  rateScale = 0.1,  lifeScale = 0.4, emitDist = 90 },
+}
+
+----------------------------------------------------------------------
+-- เช็กอุปกรณ์
+----------------------------------------------------------------------
+if CONFIG.ONLY_ON_MOBILE then
+	local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+	if not isMobile then
+		return
+	end
+end
+
+if not game:IsLoaded() then
+	game.Loaded:Wait()
+end
+
+----------------------------------------------------------------------
+-- STATE
+----------------------------------------------------------------------
+local tierIndex = math.clamp(CONFIG.START_TIER, 1, #TIERS)
+local tier = TIERS[tierIndex]
+
+local lights = {}   -- [Light] = { ours = false, dist = 0, light = Light }
+local emitters = {} -- [ParticleEmitter] = { rate, life, ours }
+local zones = {}    -- [path] = { root, b = {x0,y0,z0,x1,y1,z1}, culled, conn, token, computing }
+local clayDone = setmetatable({}, { __mode = "k" })
+local charCache = setmetatable({}, { __mode = "k" })
+
+----------------------------------------------------------------------
+-- Helpers
+----------------------------------------------------------------------
+local function isCharacterPart(inst)
+	local p = inst.Parent
+	while p and p ~= Workspace and p ~= game do
+		local c = charCache[p]
+		if c == nil then
+			c = p:IsA("Model") and p:FindFirstChildOfClass("Humanoid") ~= nil
+			charCache[p] = c
+		end
+		if c then
+			return true
+		end
+		p = p.Parent
+	end
+	return false
+end
+
+local function posOf(inst)
+	local p = inst.Parent
+	while p and p ~= game do
+		if p:IsA("Attachment") then
+			return p.WorldPosition
+		elseif p:IsA("BasePart") then
+			return p.Position
+		end
+		p = p.Parent
+	end
+	return nil
+end
+
+local function findByPath(path)
+	local cur = Workspace
+	for name in string.gmatch(path, "[^%.]+") do
+		cur = cur and cur:FindFirstChild(name)
+		if not cur then
+			return nil
+		end
+	end
+	return cur
+end
+
+local function clayColor(c)
+	local h, s, v = c:ToHSV()
+	return Color3.fromHSV(h, s * CONFIG.CLAY_SATURATION, math.clamp(v + CONFIG.CLAY_LIGHTEN, 0, 1))
+end
+
+local function scaledLifetime(range, scale)
+	return NumberRange.new(math.max(range.Min * scale, 0.05), math.max(range.Max * scale, 0.05))
+end
+
+----------------------------------------------------------------------
+-- Global settings
+----------------------------------------------------------------------
+local function applyGlobalSettings()
+	pcall(function()
+		Lighting.GlobalShadows = false
+	end)
+	pcall(function()
+		Lighting.EnvironmentSpecularScale = 0
+	end)
+
+	if CONFIG.CLAY_MODE and CONFIG.CLAY_LIGHTING then
+		pcall(function()
+			Lighting.Ambient = Color3.fromRGB(150, 140, 130)
+			Lighting.OutdoorAmbient = Color3.fromRGB(165, 155, 145)
+			Lighting.ColorShift_Top = Color3.fromRGB(255, 244, 232)
+		end)
+	end
+
+	pcall(function()
+		settings().Rendering.QualityLevel = string.format("Level%02d", math.clamp(CONFIG.QUALITY_LEVEL, 1, 21))
+	end)
+	pcall(function()
+		settings().Rendering.MeshPartDetailLevel = Enum.MeshPartDetailLevel.Level04
+	end)
+
+	local terrain = Workspace:FindFirstChildOfClass("Terrain")
+	if terrain then
+		pcall(function()
+			terrain.WaterWaveSize = 0
+			terrain.WaterWaveSpeed = 0
+			terrain.WaterReflectance = 0
+		end)
+		pcall(function()
+			terrain.Decoration = false
+		end)
+	end
+end
+
+----------------------------------------------------------------------
+-- Per-instance handling
+----------------------------------------------------------------------
+local function applyClay(part)
+	if clayDone[part] then
+		return
+	end
+	clayDone[part] = true
+
+	if not CONFIG.CLAY_INCLUDE_CHARACTERS and isCharacterPart(part) then
+		return
+	end
+	if CONFIG.CLAY_STRIP_TEXTURES and part:IsA("MeshPart") and part.TextureID ~= "" then
+		pcall(function()
+			part.TextureID = ""
+		end)
+	end
+	if CONFIG.CLAY_KEEP_NEON and part.Material == Enum.Material.Neon then
+		return
+	end
+	pcall(function()
+		part.Material = Enum.Material.SmoothPlastic
+		part.Color = clayColor(part.Color)
+	end)
+end
+
+local function optimizePart(part)
+	if part:IsA("Terrain") then
+		return
+	end
+	if CONFIG.CLAY_MODE then
+		applyClay(part)
+	end
+	if part.CastShadow then
+		part.CastShadow = false
+	end
+	if part.Reflectance > 0 then
+		part.Reflectance = 0
+	end
+	if part:IsA("MeshPart") and part.RenderFidelity ~= Enum.RenderFidelity.Performance then
+		pcall(function()
+			part.RenderFidelity = Enum.RenderFidelity.Performance
+		end)
+	end
+end
+
+local function registerLight(light)
+	if light.Shadows then
+		light.Shadows = false
+	end
+	if not lights[light] then
+		lights[light] = { ours = false, dist = 0, light = light }
+	end
+end
+
+local function registerEmitter(e)
+	local cam = Workspace.CurrentCamera
+	if CONFIG.DISABLE_LENS_FLARE and cam and e:IsDescendantOf(cam) then
+		e.Enabled = false
+		return
+	end
+	if not emitters[e] then
+		local data = { rate = e.Rate, life = e.Lifetime, ours = false }
+		emitters[e] = data
+		e.Rate = data.rate * tier.rateScale
+		e.Lifetime = scaledLifetime(data.life, tier.lifeScale)
+	end
+end
+
+local function handle(inst)
+	if inst:IsA("BasePart") then
+		optimizePart(inst)
+	elseif inst:IsA("Light") then
+		registerLight(inst)
+	elseif inst:IsA("ParticleEmitter") then
+		registerEmitter(inst)
+	elseif CONFIG.CLAY_MODE and CONFIG.CLAY_STRIP_PBR and inst:IsA("SurfaceAppearance") then
+		inst:Destroy()
+	elseif CONFIG.CLAY_MODE and CONFIG.CLAY_STRIP_TEXTURES and inst:IsA("Decal") then -- รวม Texture
+		if (CONFIG.CLAY_INCLUDE_CHARACTERS or not isCharacterPart(inst))
+			and not (CONFIG.CLAY_KEEP_FACES and inst.Name == "face") then
+			inst:Destroy()
+		end
+	elseif CONFIG.CLAY_MODE and CONFIG.CLAY_STRIP_TEXTURES and inst:IsA("SpecialMesh") then
+		pcall(function()
+			inst.TextureId = ""
+		end)
+	elseif CONFIG.CLAY_MODE and CONFIG.CLAY_STRIP_TEXTURES and CONFIG.CLAY_INCLUDE_CHARACTERS
+		and (inst:IsA("Shirt") or inst:IsA("Pants") or inst:IsA("ShirtGraphic")) then
+		inst:Destroy()
+	elseif CONFIG.DISABLE_LEGACY_FX and (inst:IsA("Fire") or inst:IsA("Smoke") or inst:IsA("Sparkles")) then
+		inst.Enabled = false
+	elseif CONFIG.DISABLE_POST_EFFECTS and inst:IsA("PostEffect") and not inst:IsA("ColorCorrectionEffect") then
+		inst.Enabled = false
+	end
+end
+
+----------------------------------------------------------------------
+-- คิวของใหม่: ทยอยประมวลผลตามงบเวลาต่อเฟรม
+----------------------------------------------------------------------
+local queue = {}
+local qHead, qTail = 1, 0
+
+local function enqueue(inst)
+	qTail += 1
+	queue[qTail] = inst
+end
+
+local function processQueue()
+	if qHead > qTail then
+		return
+	end
+	local start = os.clock()
+	while qHead <= qTail do
+		local inst = queue[qHead]
+		queue[qHead] = nil
+		qHead += 1
+		-- ของที่ถูกลบไปแล้ว (เช่น เอฟเฟกต์สั้นๆ) ข้ามได้เลย
+		if inst.Parent then
+			handle(inst)
+		end
+		if os.clock() - start > CONFIG.QUEUE_BUDGET then
+			break
+		end
+	end
+	if qHead > qTail then
+		qHead, qTail = 1, 0
+	end
+end
+
+----------------------------------------------------------------------
+-- Tier
+----------------------------------------------------------------------
+local function applyTier(newIndex)
+	tierIndex = math.clamp(newIndex, 1, #TIERS)
+	tier = TIERS[tierIndex]
+	for e, data in pairs(emitters) do
+		if e.Parent then
+			e.Rate = data.rate * tier.rateScale
+			e.Lifetime = scaledLifetime(data.life, tier.lifeScale)
+		else
+			emitters[e] = nil
+		end
+	end
+end
+
+----------------------------------------------------------------------
+-- Distance culling: lights + emitters (ไม่สร้าง table ใหม่ทุกรอบ)
+----------------------------------------------------------------------
+local lightList = {}
+local function lightCmp(a, b)
+	return a.dist < b.dist
+end
+
+local function updateLights(camPos)
+	table.clear(lightList)
+	local n = 0
+	for light, data in pairs(lights) do
+		if not light:IsDescendantOf(game) then
+			lights[light] = nil
+		elseif light.Enabled or data.ours then
+			local pos = posOf(light)
+			if pos then
+				data.dist = (pos - camPos).Magnitude
+				n += 1
+				lightList[n] = data
+			end
+		end
+	end
+
+	table.sort(lightList, lightCmp)
+
+	for i = 1, n do
+		local data = lightList[i]
+		local light = data.light
+		if i <= tier.lights and data.dist <= tier.lightDist then
+			if data.ours and not light.Enabled then
+				light.Enabled = true
+			end
+			data.ours = false
+		elseif light.Enabled then
+			light.Enabled = false
+			data.ours = true
+		end
+	end
+end
+
+local function updateEmitters(camPos)
+	local emitDist = tier.emitDist
+	for e, data in pairs(emitters) do
+		if not e:IsDescendantOf(game) then
+			emitters[e] = nil
+		else
+			local pos = posOf(e)
+			if pos then
+				if (pos - camPos).Magnitude > emitDist then
+					if e.Enabled then
+						e.Enabled = false
+						data.ours = true
+					end
+				elseif data.ours then
+					e.Enabled = true
+					data.ours = false
+				end
+			end
+		end
+	end
+end
+
+----------------------------------------------------------------------
+-- Zone culling (ทำแบบแบ่งเฟรม)
+----------------------------------------------------------------------
+local function computeBoundsAsync(zone)
+	if zone.computing then
+		return
+	end
+	zone.computing = true
+	task.spawn(function()
+		local x0, y0, z0, x1, y1, z1
+		local list = zone.root:GetDescendants()
+		for i, d in ipairs(list) do
+			if d:IsA("BasePart") then
+				local size = d.Size
+				local r = size.Magnitude / 2
+				if size.Magnitude < 1500 then
+					local p = d.Position
+					if not x0 then
+						x0, y0, z0, x1, y1, z1 = p.X - r, p.Y - r, p.Z - r, p.X + r, p.Y + r, p.Z + r
+					else
+						x0 = math.min(x0, p.X - r)
+						y0 = math.min(y0, p.Y - r)
+						z0 = math.min(z0, p.Z - r)
+						x1 = math.max(x1, p.X + r)
+						y1 = math.max(y1, p.Y + r)
+						z1 = math.max(z1, p.Z + r)
+					end
+				end
+			end
+			if i % 300 == 0 then
+				task.wait()
+			end
+		end
+		if x0 then
+			zone.b = { x0, y0, z0, x1, y1, z1 }
+		end
+		zone.computing = false
+	end)
+end
+
+local function setCulled(zone, state)
+	if zone.culled == state then
+		return
+	end
+	zone.culled = state
+	zone.token = (zone.token or 0) + 1
+	local token = zone.token
+
+	if zone.conn then
+		zone.conn:Disconnect()
+		zone.conn = nil
+	end
+	if state then
+		zone.conn = zone.root.DescendantAdded:Connect(function(d)
+			if d:IsA("BasePart") then
+				d.LocalTransparencyModifier = 1
+			end
+		end)
+	end
+
+	local value = state and 1 or 0
+	task.spawn(function()
+		local list = zone.root:GetDescendants()
+		for i, d in ipairs(list) do
+			if zone.token ~= token then
+				return -- มีการสลับสถานะใหม่แล้ว งานนี้เลิก
+			end
+			if d:IsA("BasePart") then
+				d.LocalTransparencyModifier = value
+			end
+			if i % 150 == 0 then
+				task.wait()
+			end
+		end
+	end)
+end
+
+local function refreshZones()
+	for _, path in ipairs(CONFIG.ZONES) do
+		local root = findByPath(path)
+		if root then
+			local zone = zones[path]
+			if not zone or zone.root ~= root then
+				zone = { root = root, culled = false }
+				zones[path] = zone
+			end
+			computeBoundsAsync(zone)
+		end
+	end
+end
+
+local function updateZones(camPos)
+	local cx, cy, cz = camPos.X, camPos.Y, camPos.Z
+	for _, zone in pairs(zones) do
+		local b = zone.b
+		if zone.root.Parent and b then
+			local dx = math.max(b[1] - cx, 0, cx - b[4])
+			local dy = math.max(b[2] - cy, 0, cy - b[5])
+			local dz = math.max(b[3] - cz, 0, cz - b[6])
+			local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+			if not zone.culled and dist > CONFIG.ZONE_CULL_DISTANCE then
+				setCulled(zone, true)
+			elseif zone.culled and dist < CONFIG.ZONE_CULL_DISTANCE - CONFIG.ZONE_RESTORE_MARGIN then
+				setCulled(zone, false)
+			end
+		end
+	end
+end
+
+----------------------------------------------------------------------
+-- INIT
+----------------------------------------------------------------------
+applyGlobalSettings()
+
+Workspace.DescendantAdded:Connect(enqueue)
+Lighting.DescendantAdded:Connect(enqueue)
+
+for _, inst in ipairs(Lighting:GetDescendants()) do
+	enqueue(inst)
+end
+for _, inst in ipairs(Workspace:GetDescendants()) do
+	enqueue(inst)
+end
+
+local frameTime, frameCount = 0, 0
+RunService.Heartbeat:Connect(function(dt)
+	frameTime += dt
+	frameCount += 1
+	processQueue()
+end)
+
+if CONFIG.ZONE_CULLING then
+	task.delay(3, refreshZones)
+end
+
+----------------------------------------------------------------------
+-- Main loop
+----------------------------------------------------------------------
+task.spawn(function()
+	local lastFpsCheck = os.clock()
+	local lastZoneRefresh = os.clock()
+	local goodStreak = 0
+
+	while true do
+		task.wait(0.4)
+
+		local cam = Workspace.CurrentCamera
+		if cam then
+			local camPos = cam.CFrame.Position
+			updateLights(camPos)
+			updateEmitters(camPos)
+			if CONFIG.ZONE_CULLING then
+				updateZones(camPos)
+			end
+		end
+
+		local now = os.clock()
+
+		if CONFIG.ZONE_CULLING and now - lastZoneRefresh >= CONFIG.ZONE_REFRESH_SECONDS then
+			lastZoneRefresh = now
+			refreshZones()
+		end
+
+		if CONFIG.ADAPTIVE and now - lastFpsCheck >= 3 then
+			lastFpsCheck = now
+			local fps = frameTime > 0 and frameCount / frameTime or 60
+			frameTime, frameCount = 0, 0
+
+			if fps < CONFIG.LOW_FPS and tierIndex < #TIERS then
+				goodStreak = 0
+				applyTier(tierIndex + 1)
+			elseif fps > CONFIG.GOOD_FPS then
+				goodStreak += 1
+				if goodStreak >= 4 and tierIndex > CONFIG.START_TIER then
+					goodStreak = 0
+					applyTier(tierIndex - 1)
+				end
+			else
+				goodStreak = 0
+			end
+		end
+	end
+end)
