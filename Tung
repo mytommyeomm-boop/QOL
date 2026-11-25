@@ -1,72 +1,155 @@
 --[[
-	MobileOptimizer v2 (LocalScript)
-	วางที่: StarterPlayer > StarterPlayerScripts  (ลบไฟล์เวอร์ชันเก่าออกก่อน)
+	MobileOptimizer v3 (LocalScript)
+	วางที่: StarterPlayer > StarterPlayerScripts
+	แทนที่ MobileOptimizer_v2.client.lua + PingMonitor.client.lua เดิม
 
-	แก้จากเวอร์ชันก่อน:
-	- ของที่เกิดใหม่ (เอฟเฟกต์ ฯลฯ) ถูกใส่คิวแล้วทยอยทำทีละนิดต่อเฟรม (จำกัดเวลา) ไม่ทำพร้อมกันจนกระตุก
-	- ไม่สร้าง table ใหม่ทุกรอบ -> ลด garbage ที่ทำให้กระตุกเป็นพักๆ เมื่อเล่นนาน
-	- คำนวณขอบโซน / ซ่อน-แสดงโซน ทำแบบแบ่งเฟรม ไม่ค้างทีเดียว
-	- ลด Lifetime ของ particle ด้วย (ช่วยกรณี :Emit() เป็นชุดใหญ่ ที่การลด Rate ไม่ช่วย)
-	- cache การเช็กว่าเป็นตัวละคร ไม่ไล่ขึ้น parent ซ้ำๆ
+	รวม 2 ระบบ:
+	1) MobileOptimizer v2 — clay mode, distance culling, zone culling, adaptive tier
+	2) PingMonitor — HUD FPS/Ping (ทำงานทุกแพลตฟอร์ม)
+
+	หมายเหตุ: NetworkOptimizer ยังต้องเป็น Script ฝั่ง Server แยก (Anchored ต้อง replicate)
 ]]
 
-local Players = game:GetService("Players")
-local Lighting = game:GetService("Lighting")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local Workspace = game:GetService("Workspace")
+local Players           = game:GetService("Players")
+local Lighting          = game:GetService("Lighting")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local Workspace         = game:GetService("Workspace")
+local Stats             = game:GetService("Stats")
 
 ----------------------------------------------------------------------
 -- CONFIG
 ----------------------------------------------------------------------
 local CONFIG = {
-	ONLY_ON_MOBILE = true,
-	QUALITY_LEVEL = 3,
-	START_TIER = 1,
-	ADAPTIVE = true,
-	LOW_FPS = 25,
-	GOOD_FPS = 50,
+	ONLY_ON_MOBILE   = true,
+	QUALITY_LEVEL    = 3,
+	START_TIER       = 1,
+	ADAPTIVE         = true,
+	LOW_FPS          = 25,
+	GOOD_FPS         = 50,
 
-	QUEUE_BUDGET = 0.0015,      -- วินาทีต่อเฟรมที่ใช้ประมวลผลของใหม่ (ต่ำ = นุ่มกว่า แต่ของใหม่โดนแก้ช้าลง)
+	QUEUE_BUDGET     = 0.0015,
 
-	DISABLE_LENS_FLARE = true,
-	DISABLE_LEGACY_FX = true,
+	DISABLE_LENS_FLARE  = true,
+	DISABLE_LEGACY_FX   = true,
 	DISABLE_POST_EFFECTS = true,
 
-	-- โหมดดินน้ำมัน
-	CLAY_MODE = true,
-	CLAY_SATURATION = 0.8,
-	CLAY_LIGHTEN = 0.06,
-	CLAY_KEEP_NEON = true,
+	CLAY_MODE            = true,
+	CLAY_SATURATION      = 0.8,
+	CLAY_LIGHTEN         = 0.06,
+	CLAY_KEEP_NEON       = true,
 	CLAY_INCLUDE_CHARACTERS = true,
-	CLAY_STRIP_PBR = true,
-	CLAY_STRIP_TEXTURES = true,
-	CLAY_KEEP_FACES = false,
-	CLAY_LIGHTING = true,
+	CLAY_STRIP_PBR       = true,
+	CLAY_STRIP_TEXTURES  = true,
+	CLAY_KEEP_FACES      = false,
+	CLAY_LIGHTING        = true,
 
-	ZONE_CULLING = true,
-	ZONES = { "map.lobby", "map.map" },
-	ZONE_CULL_DISTANCE = 600,
-	ZONE_RESTORE_MARGIN = 100,
-	ZONE_REFRESH_SECONDS = 120, -- คำนวณขอบโซนใหม่ทุกกี่วินาที (ทำแบบแบ่งเฟรม)
+	ZONE_CULLING         = true,
+	ZONES                = { "map.lobby", "map.map" },
+	ZONE_CULL_DISTANCE   = 600,
+	ZONE_RESTORE_MARGIN  = 100,
+	ZONE_REFRESH_SECONDS = 120,
+
+	-- HUD (จาก PingMonitor)
+	HUD_SHOW = true,
 }
 
 local TIERS = {
 	{ lights = 12, lightDist = 140, rateScale = 0.5,  lifeScale = 0.8, emitDist = 250 },
 	{ lights = 6,  lightDist = 90,  rateScale = 0.25, lifeScale = 0.6, emitDist = 150 },
-	{ lights = 2,  lightDist = 50,  rateScale = 0.1,  lifeScale = 0.4, emitDist = 90 },
+	{ lights = 2,  lightDist = 50,  rateScale = 0.1,  lifeScale = 0.4, emitDist = 90  },
 }
 
 ----------------------------------------------------------------------
--- เช็กอุปกรณ์
+-- Device check (ไม่ early-return แล้ว — HUD ต้องทำงานทุกเครื่อง)
 ----------------------------------------------------------------------
-if CONFIG.ONLY_ON_MOBILE then
-	local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
-	if not isMobile then
-		return
-	end
+local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+local runOptimizer = (not CONFIG.ONLY_ON_MOBILE) or isMobile
+
+----------------------------------------------------------------------
+-- FPS trackers (คนละหน้าต่าง: HUD=1s, adaptive=3s)
+----------------------------------------------------------------------
+local fpsHud   = { frames = 0, acc = 0 }
+local fpsAdapt = { frames = 0, acc = 0 }
+
+RunService.Heartbeat:Connect(function(dt)
+	fpsHud.frames   += 1
+	fpsHud.acc      += dt
+	fpsAdapt.frames += 1
+	fpsAdapt.acc    += dt
+end)
+
+local function takeFps(s)
+	local value = s.acc > 0 and s.frames / s.acc or 60
+	s.frames, s.acc = 0, 0
+	return value
 end
 
+----------------------------------------------------------------------
+-- HUD (จาก PingMonitor)
+----------------------------------------------------------------------
+local function getPing()
+	local ok, value = pcall(function()
+		return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+	end)
+	return ok and value or nil
+end
+
+local function colorFor(ping)
+	if not ping then return Color3.new(1, 1, 1) end
+	if ping < 80  then return Color3.fromRGB(90, 220, 120) end
+	if ping < 150 then return Color3.fromRGB(240, 200, 70) end
+	return Color3.fromRGB(240, 90, 90)
+end
+
+if CONFIG.HUD_SHOW then
+	task.spawn(function()
+		local player    = Players.LocalPlayer
+		local playerGui = player:WaitForChild("PlayerGui")
+
+		local gui = Instance.new("ScreenGui")
+		gui.Name           = "PingHUD"
+		gui.ResetOnSpawn   = false
+		gui.IgnoreGuiInset = true
+		gui.DisplayOrder   = 100
+		gui.Parent         = playerGui
+
+		local label = Instance.new("TextLabel")
+		label.AnchorPoint             = Vector2.new(0.5, 0)
+		label.Position                = UDim2.new(0.5, 0, 0, 4)
+		label.Size                    = UDim2.fromOffset(190, 22)
+		label.BackgroundColor3        = Color3.new(0, 0, 0)
+		label.BackgroundTransparency  = 0.5
+		label.BorderSizePixel         = 0
+		label.Font                    = Enum.Font.GothamMedium
+		label.TextSize                = 14
+		label.TextColor3              = Color3.new(1, 1, 1)
+		label.Text                    = "FPS -- | Ping -- ms"
+		label.Parent                  = gui
+		Instance.new("UICorner", label).CornerRadius = UDim.new(0, 6)
+
+		while true do
+			task.wait(1)
+			local fps  = math.floor(takeFps(fpsHud) + 0.5)
+			local ping = getPing()
+			label.Text = string.format(
+				"FPS %d | Ping %s ms",
+				fps,
+				ping and tostring(math.floor(ping + 0.5)) or "--"
+			)
+			label.TextColor3 = colorFor(ping)
+		end
+	end)
+end
+
+-- ถ้าไม่ใช่ mobile (และ ONLY_ON_MOBILE=true) จบตรงนี้ — HUD ทำงานต่อได้ตามปกติ
+if not runOptimizer then
+	return
+end
+
+----------------------------------------------------------------------
+-- รอเกมโหลด (เฉพาะตอนจะ optimize)
+----------------------------------------------------------------------
 if not game:IsLoaded() then
 	game.Loaded:Wait()
 end
@@ -77,9 +160,9 @@ end
 local tierIndex = math.clamp(CONFIG.START_TIER, 1, #TIERS)
 local tier = TIERS[tierIndex]
 
-local lights = {}   -- [Light] = { ours = false, dist = 0, light = Light }
-local emitters = {} -- [ParticleEmitter] = { rate, life, ours }
-local zones = {}    -- [path] = { root, b = {x0,y0,z0,x1,y1,z1}, culled, conn, token, computing }
+local lights   = {}
+local emitters = {}
+local zones    = {}
 local clayDone = setmetatable({}, { __mode = "k" })
 local charCache = setmetatable({}, { __mode = "k" })
 
@@ -94,9 +177,7 @@ local function isCharacterPart(inst)
 			c = p:IsA("Model") and p:FindFirstChildOfClass("Humanoid") ~= nil
 			charCache[p] = c
 		end
-		if c then
-			return true
-		end
+		if c then return true end
 		p = p.Parent
 	end
 	return false
@@ -119,9 +200,7 @@ local function findByPath(path)
 	local cur = Workspace
 	for name in string.gmatch(path, "[^%.]+") do
 		cur = cur and cur:FindFirstChild(name)
-		if not cur then
-			return nil
-		end
+		if not cur then return nil end
 	end
 	return cur
 end
@@ -139,18 +218,14 @@ end
 -- Global settings
 ----------------------------------------------------------------------
 local function applyGlobalSettings()
-	pcall(function()
-		Lighting.GlobalShadows = false
-	end)
-	pcall(function()
-		Lighting.EnvironmentSpecularScale = 0
-	end)
+	pcall(function() Lighting.GlobalShadows = false end)
+	pcall(function() Lighting.EnvironmentSpecularScale = 0 end)
 
 	if CONFIG.CLAY_MODE and CONFIG.CLAY_LIGHTING then
 		pcall(function()
-			Lighting.Ambient = Color3.fromRGB(150, 140, 130)
-			Lighting.OutdoorAmbient = Color3.fromRGB(165, 155, 145)
-			Lighting.ColorShift_Top = Color3.fromRGB(255, 244, 232)
+			Lighting.Ambient          = Color3.fromRGB(150, 140, 130)
+			Lighting.OutdoorAmbient   = Color3.fromRGB(165, 155, 145)
+			Lighting.ColorShift_Top   = Color3.fromRGB(255, 244, 232)
 		end)
 	end
 
@@ -164,13 +239,11 @@ local function applyGlobalSettings()
 	local terrain = Workspace:FindFirstChildOfClass("Terrain")
 	if terrain then
 		pcall(function()
-			terrain.WaterWaveSize = 0
-			terrain.WaterWaveSpeed = 0
-			terrain.WaterReflectance = 0
+			terrain.WaterWaveSize     = 0
+			terrain.WaterWaveSpeed    = 0
+			terrain.WaterReflectance  = 0
 		end)
-		pcall(function()
-			terrain.Decoration = false
-		end)
+		pcall(function() terrain.Decoration = false end)
 	end
 end
 
@@ -178,52 +251,32 @@ end
 -- Per-instance handling
 ----------------------------------------------------------------------
 local function applyClay(part)
-	if clayDone[part] then
-		return
-	end
+	if clayDone[part] then return end
 	clayDone[part] = true
 
-	if not CONFIG.CLAY_INCLUDE_CHARACTERS and isCharacterPart(part) then
-		return
-	end
+	if not CONFIG.CLAY_INCLUDE_CHARACTERS and isCharacterPart(part) then return end
 	if CONFIG.CLAY_STRIP_TEXTURES and part:IsA("MeshPart") and part.TextureID ~= "" then
-		pcall(function()
-			part.TextureID = ""
-		end)
+		pcall(function() part.TextureID = "" end)
 	end
-	if CONFIG.CLAY_KEEP_NEON and part.Material == Enum.Material.Neon then
-		return
-	end
+	if CONFIG.CLAY_KEEP_NEON and part.Material == Enum.Material.Neon then return end
 	pcall(function()
 		part.Material = Enum.Material.SmoothPlastic
-		part.Color = clayColor(part.Color)
+		part.Color    = clayColor(part.Color)
 	end)
 end
 
 local function optimizePart(part)
-	if part:IsA("Terrain") then
-		return
-	end
-	if CONFIG.CLAY_MODE then
-		applyClay(part)
-	end
-	if part.CastShadow then
-		part.CastShadow = false
-	end
-	if part.Reflectance > 0 then
-		part.Reflectance = 0
-	end
+	if part:IsA("Terrain") then return end
+	if CONFIG.CLAY_MODE then applyClay(part) end
+	if part.CastShadow then part.CastShadow = false end
+	if part.Reflectance > 0 then part.Reflectance = 0 end
 	if part:IsA("MeshPart") and part.RenderFidelity ~= Enum.RenderFidelity.Performance then
-		pcall(function()
-			part.RenderFidelity = Enum.RenderFidelity.Performance
-		end)
+		pcall(function() part.RenderFidelity = Enum.RenderFidelity.Performance end)
 	end
 end
 
 local function registerLight(light)
-	if light.Shadows then
-		light.Shadows = false
-	end
+	if light.Shadows then light.Shadows = false end
 	if not lights[light] then
 		lights[light] = { ours = false, dist = 0, light = light }
 	end
@@ -238,7 +291,7 @@ local function registerEmitter(e)
 	if not emitters[e] then
 		local data = { rate = e.Rate, life = e.Lifetime, ours = false }
 		emitters[e] = data
-		e.Rate = data.rate * tier.rateScale
+		e.Rate     = data.rate * tier.rateScale
 		e.Lifetime = scaledLifetime(data.life, tier.lifeScale)
 	end
 end
@@ -252,15 +305,13 @@ local function handle(inst)
 		registerEmitter(inst)
 	elseif CONFIG.CLAY_MODE and CONFIG.CLAY_STRIP_PBR and inst:IsA("SurfaceAppearance") then
 		inst:Destroy()
-	elseif CONFIG.CLAY_MODE and CONFIG.CLAY_STRIP_TEXTURES and inst:IsA("Decal") then -- รวม Texture
+	elseif CONFIG.CLAY_MODE and CONFIG.CLAY_STRIP_TEXTURES and inst:IsA("Decal") then
 		if (CONFIG.CLAY_INCLUDE_CHARACTERS or not isCharacterPart(inst))
 			and not (CONFIG.CLAY_KEEP_FACES and inst.Name == "face") then
 			inst:Destroy()
 		end
 	elseif CONFIG.CLAY_MODE and CONFIG.CLAY_STRIP_TEXTURES and inst:IsA("SpecialMesh") then
-		pcall(function()
-			inst.TextureId = ""
-		end)
+		pcall(function() inst.TextureId = "" end)
 	elseif CONFIG.CLAY_MODE and CONFIG.CLAY_STRIP_TEXTURES and CONFIG.CLAY_INCLUDE_CHARACTERS
 		and (inst:IsA("Shirt") or inst:IsA("Pants") or inst:IsA("ShirtGraphic")) then
 		inst:Destroy()
@@ -272,7 +323,7 @@ local function handle(inst)
 end
 
 ----------------------------------------------------------------------
--- คิวของใหม่: ทยอยประมวลผลตามงบเวลาต่อเฟรม
+-- Queue (ทยอยทำตามงบเวลาต่อเฟรม)
 ----------------------------------------------------------------------
 local queue = {}
 local qHead, qTail = 1, 0
@@ -283,25 +334,16 @@ local function enqueue(inst)
 end
 
 local function processQueue()
-	if qHead > qTail then
-		return
-	end
+	if qHead > qTail then return end
 	local start = os.clock()
 	while qHead <= qTail do
 		local inst = queue[qHead]
 		queue[qHead] = nil
 		qHead += 1
-		-- ของที่ถูกลบไปแล้ว (เช่น เอฟเฟกต์สั้นๆ) ข้ามได้เลย
-		if inst.Parent then
-			handle(inst)
-		end
-		if os.clock() - start > CONFIG.QUEUE_BUDGET then
-			break
-		end
+		if inst.Parent then handle(inst) end
+		if os.clock() - start > CONFIG.QUEUE_BUDGET then break end
 	end
-	if qHead > qTail then
-		qHead, qTail = 1, 0
-	end
+	if qHead > qTail then qHead, qTail = 1, 0 end
 end
 
 ----------------------------------------------------------------------
@@ -312,7 +354,7 @@ local function applyTier(newIndex)
 	tier = TIERS[tierIndex]
 	for e, data in pairs(emitters) do
 		if e.Parent then
-			e.Rate = data.rate * tier.rateScale
+			e.Rate     = data.rate * tier.rateScale
 			e.Lifetime = scaledLifetime(data.life, tier.lifeScale)
 		else
 			emitters[e] = nil
@@ -321,12 +363,10 @@ local function applyTier(newIndex)
 end
 
 ----------------------------------------------------------------------
--- Distance culling: lights + emitters (ไม่สร้าง table ใหม่ทุกรอบ)
+-- Distance culling: lights + emitters
 ----------------------------------------------------------------------
 local lightList = {}
-local function lightCmp(a, b)
-	return a.dist < b.dist
-end
+local function lightCmp(a, b) return a.dist < b.dist end
 
 local function updateLights(camPos)
 	table.clear(lightList)
@@ -350,9 +390,7 @@ local function updateLights(camPos)
 		local data = lightList[i]
 		local light = data.light
 		if i <= tier.lights and data.dist <= tier.lightDist then
-			if data.ours and not light.Enabled then
-				light.Enabled = true
-			end
+			if data.ours and not light.Enabled then light.Enabled = true end
 			data.ours = false
 		elseif light.Enabled then
 			light.Enabled = false
@@ -384,12 +422,10 @@ local function updateEmitters(camPos)
 end
 
 ----------------------------------------------------------------------
--- Zone culling (ทำแบบแบ่งเฟรม)
+-- Zone culling (แบ่งเฟรม)
 ----------------------------------------------------------------------
 local function computeBoundsAsync(zone)
-	if zone.computing then
-		return
-	end
+	if zone.computing then return end
 	zone.computing = true
 	task.spawn(function()
 		local x0, y0, z0, x1, y1, z1
@@ -403,30 +439,20 @@ local function computeBoundsAsync(zone)
 					if not x0 then
 						x0, y0, z0, x1, y1, z1 = p.X - r, p.Y - r, p.Z - r, p.X + r, p.Y + r, p.Z + r
 					else
-						x0 = math.min(x0, p.X - r)
-						y0 = math.min(y0, p.Y - r)
-						z0 = math.min(z0, p.Z - r)
-						x1 = math.max(x1, p.X + r)
-						y1 = math.max(y1, p.Y + r)
-						z1 = math.max(z1, p.Z + r)
+						x0 = math.min(x0, p.X - r); y0 = math.min(y0, p.Y - r); z0 = math.min(z0, p.Z - r)
+						x1 = math.max(x1, p.X + r); y1 = math.max(y1, p.Y + r); z1 = math.max(z1, p.Z + r)
 					end
 				end
 			end
-			if i % 300 == 0 then
-				task.wait()
-			end
+			if i % 300 == 0 then task.wait() end
 		end
-		if x0 then
-			zone.b = { x0, y0, z0, x1, y1, z1 }
-		end
+		if x0 then zone.b = { x0, y0, z0, x1, y1, z1 } end
 		zone.computing = false
 	end)
 end
 
 local function setCulled(zone, state)
-	if zone.culled == state then
-		return
-	end
+	if zone.culled == state then return end
 	zone.culled = state
 	zone.token = (zone.token or 0) + 1
 	local token = zone.token
@@ -437,9 +463,7 @@ local function setCulled(zone, state)
 	end
 	if state then
 		zone.conn = zone.root.DescendantAdded:Connect(function(d)
-			if d:IsA("BasePart") then
-				d.LocalTransparencyModifier = 1
-			end
+			if d:IsA("BasePart") then d.LocalTransparencyModifier = 1 end
 		end)
 	end
 
@@ -447,15 +471,9 @@ local function setCulled(zone, state)
 	task.spawn(function()
 		local list = zone.root:GetDescendants()
 		for i, d in ipairs(list) do
-			if zone.token ~= token then
-				return -- มีการสลับสถานะใหม่แล้ว งานนี้เลิก
-			end
-			if d:IsA("BasePart") then
-				d.LocalTransparencyModifier = value
-			end
-			if i % 150 == 0 then
-				task.wait()
-			end
+			if zone.token ~= token then return end
+			if d:IsA("BasePart") then d.LocalTransparencyModifier = value end
+			if i % 150 == 0 then task.wait() end
 		end
 	end)
 end
@@ -501,17 +519,10 @@ applyGlobalSettings()
 Workspace.DescendantAdded:Connect(enqueue)
 Lighting.DescendantAdded:Connect(enqueue)
 
-for _, inst in ipairs(Lighting:GetDescendants()) do
-	enqueue(inst)
-end
-for _, inst in ipairs(Workspace:GetDescendants()) do
-	enqueue(inst)
-end
+for _, inst in ipairs(Lighting:GetDescendants()) do enqueue(inst) end
+for _, inst in ipairs(Workspace:GetDescendants()) do enqueue(inst) end
 
-local frameTime, frameCount = 0, 0
-RunService.Heartbeat:Connect(function(dt)
-	frameTime += dt
-	frameCount += 1
+RunService.Heartbeat:Connect(function()
 	processQueue()
 end)
 
@@ -523,9 +534,9 @@ end
 -- Main loop
 ----------------------------------------------------------------------
 task.spawn(function()
-	local lastFpsCheck = os.clock()
+	local lastFpsCheck    = os.clock()
 	local lastZoneRefresh = os.clock()
-	local goodStreak = 0
+	local goodStreak      = 0
 
 	while true do
 		task.wait(0.4)
@@ -535,9 +546,7 @@ task.spawn(function()
 			local camPos = cam.CFrame.Position
 			updateLights(camPos)
 			updateEmitters(camPos)
-			if CONFIG.ZONE_CULLING then
-				updateZones(camPos)
-			end
+			if CONFIG.ZONE_CULLING then updateZones(camPos) end
 		end
 
 		local now = os.clock()
@@ -549,8 +558,7 @@ task.spawn(function()
 
 		if CONFIG.ADAPTIVE and now - lastFpsCheck >= 3 then
 			lastFpsCheck = now
-			local fps = frameTime > 0 and frameCount / frameTime or 60
-			frameTime, frameCount = 0, 0
+			local fps = takeFps(fpsAdapt)
 
 			if fps < CONFIG.LOW_FPS and tierIndex < #TIERS then
 				goodStreak = 0
